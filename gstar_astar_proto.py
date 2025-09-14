@@ -1,10 +1,15 @@
-import os, sys, json, math, heapq, argparse, textwrap, shutil
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""
+GStar A* Retrieval (GoT-style edge building + Value-aware edges)
+"""
+
+import os, json, heapq, argparse
 from typing import List, Dict, Any, Tuple
 import numpy as np
-from openai import OpenAI
-from astar_adapter import retrieve_astar_from_proto
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+from got_ops import TFIDFGoTPolicy
 
 
 def est_tokens(s: str) -> int:
@@ -18,32 +23,11 @@ class MemoryGraph:
         self.meta = meta
         self.N = len(texts)
         self.vectorizer = TfidfVectorizer(stop_words='english', ngram_range=(1, 2), min_df=1)
-        self.doc_mat = self.vectorizer.fit_transform(texts)  # 稀疏矩阵
-        self.adj = [[] for _ in range(self.N)]  # 邻接表图结构
-
-    def build_knn_edges(self, k: int = 8, sim_th: float = 0.20):
-        """
-        计算文档之间的余弦相似度矩阵，并使用knn计算 k 最相关。
-        :param k: knn超参数
-        :param sim_th: 相似度
-        :return: NULL
-        """
-        sims = cosine_similarity(self.doc_mat)
-        kk = max(1, min(k, self.N - 1))
-        for i in range(self.N):
-            idx = np.argpartition(-sims[i], kk)[:kk + 1]
-            for j in idx:
-                if j == i:
-                    continue
-                if sims[i, j] >= sim_th:
-                    self.adj[i].append((j, 1.0 - float(sims[i, j])))
+        self.doc_mat = self.vectorizer.fit_transform(texts)
+        self.adj = [[] for _ in range(self.N)]
+        self.dd_sims = None  # 文档↔文档相似度矩阵（供 A* 冗余惩罚）
 
     def build_temporal_edges(self, alpha: float = 0.15):
-        """
-        按时间排序，将相邻节点联系起来，构建记忆图
-        :param alpha: 超参数，
-        :return:
-        """
         order = sorted(range(self.N), key=lambda x: self.meta[x].get("t", x))
         for a, b in zip(order, order[1:]):
             self.adj[a].append((b, alpha))
@@ -52,25 +36,40 @@ class MemoryGraph:
         return self.vectorizer.transform([q])
 
     def sims_to_query(self, q_vec):
-        sims = cosine_similarity(self.doc_mat, q_vec).reshape(-1)
-        return sims
+        return cosine_similarity(self.doc_mat, q_vec).reshape(-1)
 
-    # 求查询需求和每一个节点之间的余弦相似度
+    def build_edges_with_policy(self, policy) -> None:
+        self.adj = [[] for _ in range(self.N)]
+        for i in range(self.N):
+            cands = list(policy.generate(i))
+            policy.score(i, cands)
+            chosen = policy.select(i, cands)
+            for c in chosen:
+                self.adj[i].append((c.j, c.cost))
+        # 把 dd 传出来，供 A* 的冗余惩罚使用
+        if hasattr(policy, "dd"):
+            self.dd_sims = policy.dd
 
-def astar_search(graph: MemoryGraph, q_vec, budget_nodes: int = 6, tau: float = 1.6,
-                 rep_lambda: float = 0.15) -> Tuple[List[int], Dict[str, Any]]:
-    sims = graph.sims_to_query(q_vec)
+
+def astar_search(graph: MemoryGraph, q_vec,
+                 budget_nodes: int = 6, tau: float = 1.6,
+                 rep_lambda: float = 0.15,
+                 gamma_q: float = 0.35,     # 查询不匹配惩罚
+                 rho_path: float = 0.25     # 路径内冗余惩罚
+                 ) -> Tuple[List[int], Dict[str, Any]]:
+    sims = graph.sims_to_query(q_vec)  # 文档↔查询
     start = int(np.argmax(sims))
 
-    # 启发函数，1 - 相似度，相似度越接近，结果越小
+    dd = graph.dd_sims
+    if dd is None:
+        dd = cosine_similarity(graph.doc_mat)
+
     def h(node_idx: int) -> float:
         return max(0.0, 1.0 - float(sims[node_idx]))
 
-    used_idxs = set()
     start_cost = est_tokens(graph.texts[start])
     start_sim = float(sims[start])
 
-    # 实际代价： 边代价，重复惩罚，token成本
     openpq = [(start_cost + h(start), start_cost, start, [start], {start}, start_sim, start_cost)]
     visited_best_g = {start: start_cost}
 
@@ -82,19 +81,34 @@ def astar_search(graph: MemoryGraph, q_vec, budget_nodes: int = 6, tau: float = 
         if sum_sims >= tau or len(path) >= budget_nodes:
             best_path, best_info = path, {"sum_sims": sum_sims, "total_tokens": total_tokens}
             break
+
         for v, edge_cost in graph.adj[u]:
+            if v in path:
+                continue
+            # 查询不匹配惩罚（越不贴，越罚）
+            q_pen = gamma_q * (1.0 - float(sims[v]))
+            # 路径冗余惩罚（越像已选，越罚）
+            if path:
+                max_sim = float(np.max(dd[v, np.array(path, dtype=int)]))
+            else:
+                max_sim = 0.0
+            mmr_pen = rho_path * max_sim
+
             rep_pen = rep_lambda if v in used else 0.0
             add_tokens = est_tokens(graph.texts[v])
-            g2 = g + edge_cost + rep_pen + 0.01 * add_tokens
+            g2 = g + edge_cost + rep_pen + 0.01 * add_tokens + q_pen + mmr_pen
+
             if v not in visited_best_g or g2 < visited_best_g[v] - 1e-9:
                 visited_best_g[v] = g2
-                used2 = set(used)
-                if v not in used2:
-                    used2.add(v)
-                sum_sims2 = sum_sims + float(sims[v]) if v not in path else sum_sims
-                total_tokens2 = total_tokens + add_tokens if v not in path else total_tokens
+                used2 = set(used); used2.add(v)
+                sum_sims2 = sum_sims + float(sims[v])
+                total_tokens2 = total_tokens + add_tokens
                 f2 = g2 + h(v)
+                if sum_sims2 > best_info["sum_sims"] + 1e-9:
+                    best_path = path + [v]
+                    best_info = {"sum_sims": sum_sims2, "total_tokens": total_tokens2}
                 heapq.heappush(openpq, (f2, g2, v, path + [v], used2, sum_sims2, total_tokens2))
+
     return best_path, best_info
 
 
@@ -109,7 +123,7 @@ def summarize_path(texts: List[str], path: List[int], query: str, model: str = "
         return "(LLM OFF) openai package not installed. pip install openai"
     client = OpenAI(base_url=base, api_key=key)
     evidence = "\n\n".join([f"[{i}] {texts[i][:300]}" for i in path])
-    prompt = f"""You are given a user query and a chain of evidence (ordered). 
+    prompt = f"""You are given a user query and a chain of evidence (ordered).
 Answer the query concisely, citing the most relevant evidence indices in [] if helpful.
 Query: {query}
 
@@ -137,9 +151,25 @@ def main():
     ap.add_argument("--alpha", type=float, default=0.15)
     ap.add_argument("--budget_nodes", type=int, default=6)
     ap.add_argument("--tau", type=float, default=1.6)
-    ap.add_argument("--model", type=str, default="qwen-plus", help="LLM model name if calling OpenAI-compatible API")
-    ap.add_argument("--llm", action="store_true", help="call LLM to summarize/answer")
+    # GoT/价值剪枝参数
+    ap.add_argument("--edge_select", type=str, default="value", choices=["value","topk"])
+    ap.add_argument("--rho", type=float, default=0.35, help="Base redundancy weight (used if auto_rho=False)")
+    ap.add_argument("--lam_cost", type=float, default=0.10, help="Token cost penalty in value pruning")
+    ap.add_argument("--edge_budget_tokens", type=int, default=0, help="Per-node edge token budget; 0=unlimited")
+    ap.add_argument("--auto_rho", type=int, default=1, help="1: enable per-node adaptive rho; 0: fixed rho")
+    ap.add_argument("--rho_min", type=float, default=0.30)
+    ap.add_argument("--rho_max", type=float, default=0.70)
+    # A* 正则
+    ap.add_argument("--gamma_q", type=float, default=0.35, help="Query mismatch penalty in A*")
+    ap.add_argument("--rho_path", type=float, default=0.25, help="Path redundancy penalty in A*")
+    # LLM
+    ap.add_argument("--model", type=str, default="qwen-plus")
+    ap.add_argument("--llm", action="store_true")
+    ap.add_argument("--edge_gamma_q", type=float, default=0.05, help="Edge-level query mismatch penalty (gentle)")
+    ap.add_argument("--edge_q_floor", type=float, default=0.10, help="Floor for sim_q in edge-level penalty")
     args = ap.parse_args()
+
+    # 1) 读数据
     texts, meta = [], []
     if args.data and os.path.exists(args.data):
         with open(args.data, "r", encoding="utf-8") as f:
@@ -152,22 +182,60 @@ def main():
             ("You are in the kitchen. The fridge is closed. There is an apple on the counter next to a knife.", 1),
             ("Open the fridge first before placing any item inside. The fridge has a shelf for produce.", 2),
             ("The living room contains a sofa and a TV. A remote lies on the table.", 3),
-            (
-                "To put the apple into the fridge: pick up the apple, open the fridge door, place the apple on the top shelf.",
-                4),
+            ("To put the apple into the fridge: pick up the apple, open the fridge door, place the apple on the top shelf.", 4),
             ("Microwave usage: never put metallic objects inside. Use 1 minute to reheat leftovers.", 5),
             ("After placing items in the fridge, close the door to keep temperature stable.", 6),
             ("Bedroom notes: closet is on the left, window on the right.", 7),
             ("If the fridge door is stuck, pull the handle firmly. Do not force beyond normal resistance.", 8),
         ]
         for s, t in toy:
-            texts.append(s)
-            meta.append({"t": t})
+            texts.append(s); meta.append({"t": t})
+
     mg = MemoryGraph(texts, meta)
-    mg.build_knn_edges(k=args.k, sim_th=args.sim_th)
-    mg.build_temporal_edges(alpha=args.alpha)
+
+    # 2) 计算与查询的相似度（TF-IDF），并归一化到 [0,1]
     q_vec = mg.query_vector(args.query)
-    path, info = astar_search(mg, q_vec, budget_nodes=args.budget_nodes, tau=args.tau)
+    sim_q = mg.sims_to_query(q_vec)
+    sim_q = (sim_q - sim_q.min()) / (sim_q.max() - sim_q.min() + 1e-9)
+
+    # 3) GoT 策略建图（价值剪枝 + 自适应 ρ）
+    token_costs = np.array([est_tokens(t) for t in texts], dtype=np.float32)
+    policy = TFIDFGoTPolicy(
+        doc_mat=mg.doc_mat, sim_q=sim_q,
+        k_doc=args.k, kq=max(1, args.k // 2),
+        q_lambda=0.55, sim_mode="pct", sim_th=args.sim_th, sim_pct=0.80,
+        keep_n=max(args.k, 6), ensure_deg=2,
+        select_mode=args.edge_select,
+        token_costs=token_costs,
+        rho=args.rho, lam_cost=args.lam_cost,
+        budget_tokens=(args.edge_budget_tokens if args.edge_budget_tokens > 0 else None),
+        auto_rho=bool(args.auto_rho), rho_min=args.rho_min, rho_max=args.rho_max,
+        edge_gamma_q=args.edge_gamma_q, edge_q_floor=args.edge_q_floor,
+    )
+
+    mg.build_edges_with_policy(policy)
+
+    # 4) 时间边：仅当 alpha>0 时添加
+    if args.alpha > 0:
+        mg.build_temporal_edges(alpha=args.alpha)
+
+    # 5) 调试：查看节点 3 的邻居
+    i = 3
+    sims_doc = cosine_similarity(mg.doc_mat)
+    nbrs = sorted(mg.adj[i], key=lambda x: x[1])[:10]
+    print(f"\n[DEBUG] Neighbors of node {i}:")
+    for j, cost in nbrs:
+        edge_type = "temporal" if args.alpha > 0 and abs(cost - args.alpha) < 1e-9 else "knn"
+        sim_ij = float(sims_doc[i, j])
+        print(f"  {i} -> {j}  edge={edge_type:8s}  edge_cost={cost:.3f}  sim(doc{i},doc{j})={sim_ij:.3f}")
+
+    # 6) A* 搜索（含查询/冗余软约束）
+    path, info = astar_search(
+        mg, q_vec,
+        budget_nodes=args.budget_nodes, tau=args.tau,
+        gamma_q=args.gamma_q, rho_path=args.rho_path
+    )
+
     print("=== GStar A* Retrieval Prototype ===")
     print(f"Query: {args.query}")
     print(f"Path (node indices): {path}")
