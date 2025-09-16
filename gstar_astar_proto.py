@@ -10,6 +10,11 @@ import numpy as np
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
 from got_ops import TFIDFGoTPolicy
+import json, time, re
+from typing import Tuple
+
+
+
 
 
 def est_tokens(s: str) -> int:
@@ -330,6 +335,169 @@ def _get_openai_compat_from_env():
         or "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
     return base, key, model
 
+def _norm(s: str) -> str:
+    return re.sub(r"\s+", " ", (s or "").strip().lower())
+
+def _sent_split(text: str) -> list[str]:
+    # 简单句子切分：句号/问号/换行；可按需替换成更强的分句器
+    text = (text or "").strip()
+    parts = re.split(r"(?<=[\.\?\!])\s+|\n+", text)
+    return [p.strip() for p in parts if p.strip()]
+
+def _common_prefix_len(a_tokens: list[str], b_tokens: list[str]) -> int:
+    n = min(len(a_tokens), len(b_tokens))
+    i = 0
+    while i < n and a_tokens[i] == b_tokens[i]:
+        i += 1
+    return i
+
+class RAGMemory:
+    """
+    以 JSONL 方式存储问答记忆（追加写入，按 qid 去重折叠）。
+    每条item结构：
+      {"qid": "...", "q": "...", "a": "...", "segments": [{"text": "...","t": 1234}, ...], "t": 1234}
+    """
+    def __init__(self, path: str = "data/memory.jsonl"):
+        self.path = path
+        self.items = []          # 折叠后的最新视图
+        self._by_qid = {}        # qid -> item
+        self._load()
+
+    def _load(self):
+        self.items, self._by_qid = [], {}
+        if os.path.exists(self.path):
+            with open(self.path, "r", encoding="utf-8") as f:
+                for line in f:
+                    try:
+                        it = json.loads(line)
+                    except Exception:
+                        continue
+                    qid = it.get("qid") or _norm(it.get("q",""))
+                    self._by_qid[qid] = it  # 以最后一次为准（折叠）
+        self.items = list(self._by_qid.values())
+
+    def _save_replace(self, item: dict):
+        os.makedirs(os.path.dirname(self.path), exist_ok=True)
+        # 以“更新”事件追加，读取时按 qid 折叠到最新
+        with open(self.path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(item, ensure_ascii=False) + "\n")
+        self._by_qid[item["qid"]] = item
+        self.items = list(self._by_qid.values())
+
+    def exact_match(self, q: str):
+        nq = _norm(q)
+        for it in self.items:
+            if _norm(it.get("q","")) == nq:
+                return it
+        return None
+
+    def partial_match(self, q: str, threshold: float = 0.88) -> Tuple[dict, float]:
+        # 用 TF-IDF 做简易相似度检索
+        from sklearn.feature_extraction.text import TfidfVectorizer
+        from sklearn.metrics.pairwise import cosine_similarity
+        qs = [_norm(it.get("q","")) for it in self.items]
+        if not qs:
+            return None, 0.0
+        vec = TfidfVectorizer(stop_words="english", ngram_range=(1,2))
+        X = vec.fit_transform(qs)
+        v = vec.transform([_norm(q)])
+        sims = cosine_similarity(X, v).reshape(-1)
+        i = int(sims.argmax())
+        sc = float(sims[i])
+        return (self.items[i], sc) if sc >= threshold else (None, sc)
+
+    def upsert_with_breakpoint(self, q: str, new_full_answer: str, base_qid: str | None):
+        """
+        把 new_full_answer 合并入 base_qid（若存在），只在“断点”之后追加 segments；
+        若找不到 base_qid，则创建新item。
+        """
+        now = int(time.time())
+        if base_qid and base_qid in self._by_qid:
+            item = self._by_qid[base_qid]
+        else:
+            # 新建
+            qid = _norm(q)
+            segs = [{"text": s, "t": now} for s in _sent_split(new_full_answer)]
+            item = {"qid": qid, "q": q, "a": new_full_answer, "segments": segs, "t": now}
+            self._save_replace(item)
+            return item
+
+        old_ans = item.get("a","")
+        old_tok = old_ans.split()
+        new_tok = (new_full_answer or "").split()
+        bp = _common_prefix_len(old_tok, new_tok)  # 断点位置（按词）
+
+        # 仅追加“断点之后”的内容
+        new_tail = " ".join(new_tok[bp:]).strip()
+        if not new_tail:
+            return item  # 无新增
+
+        # 更新全文
+        merged = (old_ans + (" " if old_ans and new_tail else "") + new_tail).strip()
+        # 生成新的段落/句子分段（只对 tail 切分）
+        new_segments = [{"text": s, "t": now} for s in _sent_split(new_tail)]
+        segs = (item.get("segments") or []) + new_segments
+
+        new_item = {"qid": item["qid"], "q": item.get("q", q), "a": merged, "segments": segs, "t": now}
+        self._save_replace(new_item)
+        return new_item
+
+def _answer_via_gstar_llm(query: str, memory_items: list[dict]) -> str:
+    """
+    用你现有的 GStar 检索 + summarize_path 生成完整新答案。
+    把记忆的 Q/A 作为“证据文本”构图检索，然后走 summarize_path。
+    """
+    texts, meta = [], []
+    for i, it in enumerate(memory_items):
+        txt = (f"Q: {it.get('q','')}\nA: {it.get('a','')}").strip()
+        texts.append(txt); meta.append({"t": it.get("t", i)})
+
+    mg = MemoryGraph(texts if texts else ["(empty)"], meta if meta else [{"t": 0}])  # <-- 你现有的类
+    q_vec = mg.query_vector(query)
+    sim_q = mg.sims_to_query(q_vec)
+    sim_q = (sim_q - sim_q.min()) / (sim_q.max() - sim_q.min() + 1e-9)
+
+    token_costs = np.array([est_tokens(t) for t in texts or ["(empty)"]], dtype=np.float32)
+    policy = TFIDFGoTPolicy(
+        doc_mat=mg.doc_mat, sim_q=sim_q,
+        k_doc=min(8, len(texts) or 1), kq=3,
+        q_lambda=0.55, sim_mode="pct", sim_th=0.20, sim_pct=0.80,
+        keep_n=max(6, min(8, len(texts) or 1)), ensure_deg=2,
+        select_mode="value", token_costs=token_costs,
+        rho=0.35, lam_cost=0.05, budget_tokens=None,
+        auto_rho=True, rho_min=0.30, rho_max=0.70,
+        edge_gamma_q=0.05, edge_q_floor=0.10,
+    )
+    mg.build_edges_with_policy(policy)
+    path, _info = astar_search(mg, q_vec, budget_nodes=6, tau=1.6, gamma_q=0.35, rho_path=0.25)
+    return summarize_path(texts or ["(empty)"], path, query)
+
+def answer_with_memory_router_bp(query: str, memory_path: str = "data/memory.jsonl",
+                                 partial_th: float = 0.88) -> Tuple[str, dict]:
+    """
+    三段式 + 断点合并：
+      1) 完全相同：直接返回旧答（零LLM）
+      2) 部分相同/不相同：先用旧答作部分记忆，再生成完整新答；只把“断点后的尾部”并入同一条记忆
+    返回：(answer, meta)
+    """
+    mem = RAGMemory(memory_path)
+
+    # 1) exact
+    hit = mem.exact_match(query)
+    if hit:
+        return hit.get("a",""), {"route": "exact", "qid": hit.get("qid")}
+
+    # 2) partial（>=阈值） or novel（<阈值）
+    near, score = mem.partial_match(query, threshold=partial_th)
+    base_qid = near.get("qid") if near else None
+
+    # 用“部分记忆/全部记忆”作为证据构图，让 LLM 生成完整新答案
+    # （你也可以换成只生成补全尾部的提示，这里保持稳妥：先拿全新答案，再做断点合并）
+    ans_full = _answer_via_gstar_llm(query, mem.items if mem.items else [])
+
+    # 断点合并到“同一条记忆”（不是新建）
+    item = mem.upsert_with_breakpoint(q=query, new_full_answer=ans_full, base_qid=base_qid)
+    return item.get("a",""), {"route": ("partial" if near else "novel"), "near_score": score, "qid": item.get("qid")}
 
 if __name__ == "__main__":
     main()
