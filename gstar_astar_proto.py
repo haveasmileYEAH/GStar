@@ -113,10 +113,13 @@ def astar_search(graph: MemoryGraph, q_vec,
 
 
 def summarize_path(texts: List[str], path: List[int], query: str, model: str = "qwen-plus") -> str:
-    base = os.environ.get("OPENAI_API_BASE")
-    key = os.environ.get("OPENAI_API_KEY")
+    # === updated: accept OPENAI_*, QWEN_*, TOGETHER_* ===
+    base_env, key_env, model_env = _get_openai_compat_from_env()
+    base = base_env or os.environ.get("OPENAI_API_BASE")
+    key = key_env or os.environ.get("OPENAI_API_KEY")
+    mdl = model_env or model
     if not base or not key:
-        return "(LLM OFF) Set OPENAI_API_BASE & OPENAI_API_KEY to enable Qwen Intl summarization."
+        return "(LLM OFF) Set OPENAI_API_BASE/KEY or QWEN_BASE_URL/DASHSCOPE_API_KEY (or TOGETHER_*) to enable summarization."
     try:
         from openai import OpenAI
     except Exception:
@@ -132,7 +135,7 @@ Evidence:
 """
     try:
         r = client.chat.completions.create(
-            model=model,
+            model=mdl,
             messages=[{"role": "user", "content": prompt}],
             max_tokens=200,
             temperature=0.2,
@@ -140,6 +143,7 @@ Evidence:
         return r.choices[0].message.content
     except Exception as e:
         return f"(LLM OFF) Error calling LLM: {e}"
+
 
 
 def main():
@@ -251,6 +255,80 @@ def main():
         print("\n--- LLM Answer (Qwen Intl via OpenAI-compatible API) ---")
         ans = summarize_path(texts, path, args.query, model=args.model)
         print(ans)
+
+# === NEW: choose one admissible action using your GStar (GoT+A*) ===
+def choose_action_with_gstar(obs: str,
+                             admissible: List[str],
+                             goal: str = "",
+                             k: int = 8,
+                             tau: float = 1.05,
+                             budget_nodes: int = 3,
+                             edge_alpha: float = 0.0) -> str:
+    """
+    Use your MemoryGraph + TFIDFGoTPolicy + A* to pick EXACTLY ONE action from `admissible`.
+    ALFWorld is English-only; `obs` / `admissible` / `goal` should be English strings.
+    """
+    # 0) guard
+    if not admissible:
+        return "look"
+
+    # 1) Build a tiny graph on candidate actions
+    texts = list(dict.fromkeys(admissible))  # de-dup, keep order
+    meta = [{"t": i} for i in range(len(texts))]
+
+    mg = MemoryGraph(texts, meta)
+
+    # 2) Query = goal + observation
+    query = (goal.strip() + "\n" + obs.strip()).strip()
+    q_vec = mg.query_vector(query)
+    sim_q = mg.sims_to_query(q_vec)
+    sim_q = (sim_q - sim_q.min()) / (sim_q.max() - sim_q.min() + 1e-9)
+
+    # 3) Build edges with your GoT policy (value-aware)
+    token_costs = np.array([est_tokens(t) for t in texts], dtype=np.float32)
+    k_doc = min(max(3, k), len(texts))
+    policy = TFIDFGoTPolicy(
+        doc_mat=mg.doc_mat, sim_q=sim_q,
+        k_doc=k_doc, kq=max(1, min(3, k_doc)),
+        q_lambda=0.55, sim_mode="pct", sim_th=0.0, sim_pct=0.80,
+        keep_n=len(texts), ensure_deg=1,
+        select_mode="value",
+        token_costs=token_costs,
+        rho=0.35, lam_cost=0.05,
+        budget_tokens=None,
+        auto_rho=True, rho_min=0.30, rho_max=0.70,
+        edge_gamma_q=0.05, edge_q_floor=0.10,
+    )
+    mg.build_edges_with_policy(policy)
+    if edge_alpha > 0:
+        mg.build_temporal_edges(alpha=edge_alpha)
+
+    # 4) A* over the action graph; we only need the best-first node as the action
+    path, info = astar_search(
+        mg, mg.query_vector(query),
+        budget_nodes=max(1, budget_nodes), tau=tau,
+        gamma_q=0.35, rho_path=0.25
+    )
+    best_idx = path[0] if path else int(np.argmax(sim_q))
+    return texts[best_idx]
+
+
+# === PATCH: make summarize_path read your current env vars too (backward-compatible) ===
+def _get_openai_compat_from_env():
+    """
+    Return (base_url, api_key, model) with compatibility for OPENAI_*, QWEN_*, TOGETHER_*.
+    """
+    base = os.environ.get("OPENAI_API_BASE") \
+        or os.environ.get("QWEN_BASE_URL") \
+        or os.environ.get("TOGETHER_BASE_URL")
+    key = os.environ.get("OPENAI_API_KEY") \
+        or os.environ.get("DASHSCOPE_API_KEY") \
+        or os.environ.get("TOGETHER_API_KEY")
+    model = os.environ.get("OPENAI_MODEL") \
+        or os.environ.get("QWEN_MODEL") \
+        or os.environ.get("TOGETHER_MODEL") \
+        or "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+    return base, key, model
 
 
 if __name__ == "__main__":
