@@ -12,12 +12,6 @@ from sklearn.metrics.pairwise import cosine_similarity
 from got_ops import TFIDFGoTPolicy
 import json, time, re
 from typing import Tuple
-<<<<<<< HEAD
-=======
-
-
-
->>>>>>> 10a728a11d0ac2709003cb36afc2b59ba5e19525
 
 
 def est_tokens(s: str) -> int:
