@@ -1,0 +1,3 @@
+[submodule "vendor/CDMem"]
+	path = vendor/CDMem
+	url = https://github.com/piri-gao/CDMem.git
