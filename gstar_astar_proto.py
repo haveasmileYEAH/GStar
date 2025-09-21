@@ -14,9 +14,6 @@ import json, time, re
 from typing import Tuple
 
 
-
-
-
 def est_tokens(s: str) -> int:
     w = len(s.split())
     return max(1, int(round(w * 1.3)))
@@ -59,8 +56,8 @@ class MemoryGraph:
 def astar_search(graph: MemoryGraph, q_vec,
                  budget_nodes: int = 6, tau: float = 1.6,
                  rep_lambda: float = 0.15,
-                 gamma_q: float = 0.35,     # 查询不匹配惩罚
-                 rho_path: float = 0.25     # 路径内冗余惩罚
+                 gamma_q: float = 0.35,  # 查询不匹配惩罚
+                 rho_path: float = 0.25  # 路径内冗余惩罚
                  ) -> Tuple[List[int], Dict[str, Any]]:
     sims = graph.sims_to_query(q_vec)  # 文档↔查询
     start = int(np.argmax(sims))
@@ -105,7 +102,8 @@ def astar_search(graph: MemoryGraph, q_vec,
 
             if v not in visited_best_g or g2 < visited_best_g[v] - 1e-9:
                 visited_best_g[v] = g2
-                used2 = set(used); used2.add(v)
+                used2 = set(used);
+                used2.add(v)
                 sum_sims2 = sum_sims + float(sims[v])
                 total_tokens2 = total_tokens + add_tokens
                 f2 = g2 + h(v)
@@ -150,7 +148,6 @@ Evidence:
         return f"(LLM OFF) Error calling LLM: {e}"
 
 
-
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", type=str, default="", help="path to jsonl with fields: {text, t}")
@@ -161,7 +158,7 @@ def main():
     ap.add_argument("--budget_nodes", type=int, default=6)
     ap.add_argument("--tau", type=float, default=1.6)
     # GoT/价值剪枝参数
-    ap.add_argument("--edge_select", type=str, default="value", choices=["value","topk"])
+    ap.add_argument("--edge_select", type=str, default="value", choices=["value", "topk"])
     ap.add_argument("--rho", type=float, default=0.35, help="Base redundancy weight (used if auto_rho=False)")
     ap.add_argument("--lam_cost", type=float, default=0.10, help="Token cost penalty in value pruning")
     ap.add_argument("--edge_budget_tokens", type=int, default=0, help="Per-node edge token budget; 0=unlimited")
@@ -191,14 +188,17 @@ def main():
             ("You are in the kitchen. The fridge is closed. There is an apple on the counter next to a knife.", 1),
             ("Open the fridge first before placing any item inside. The fridge has a shelf for produce.", 2),
             ("The living room contains a sofa and a TV. A remote lies on the table.", 3),
-            ("To put the apple into the fridge: pick up the apple, open the fridge door, place the apple on the top shelf.", 4),
+            (
+            "To put the apple into the fridge: pick up the apple, open the fridge door, place the apple on the top shelf.",
+            4),
             ("Microwave usage: never put metallic objects inside. Use 1 minute to reheat leftovers.", 5),
             ("After placing items in the fridge, close the door to keep temperature stable.", 6),
             ("Bedroom notes: closet is on the left, window on the right.", 7),
             ("If the fridge door is stuck, pull the handle firmly. Do not force beyond normal resistance.", 8),
         ]
         for s, t in toy:
-            texts.append(s); meta.append({"t": t})
+            texts.append(s);
+            meta.append({"t": t})
 
     mg = MemoryGraph(texts, meta)
 
@@ -260,6 +260,7 @@ def main():
         print("\n--- LLM Answer (Qwen Intl via OpenAI-compatible API) ---")
         ans = summarize_path(texts, path, args.query, model=args.model)
         print(ans)
+
 
 # === NEW: choose one admissible action using your GStar (GoT+A*) ===
 def choose_action_with_gstar(obs: str,
@@ -324,25 +325,28 @@ def _get_openai_compat_from_env():
     Return (base_url, api_key, model) with compatibility for OPENAI_*, QWEN_*, TOGETHER_*.
     """
     base = os.environ.get("OPENAI_API_BASE") \
-        or os.environ.get("QWEN_BASE_URL") \
-        or os.environ.get("TOGETHER_BASE_URL")
+           or os.environ.get("QWEN_BASE_URL") \
+           or os.environ.get("TOGETHER_BASE_URL")
     key = os.environ.get("OPENAI_API_KEY") \
-        or os.environ.get("DASHSCOPE_API_KEY") \
-        or os.environ.get("TOGETHER_API_KEY")
+          or os.environ.get("DASHSCOPE_API_KEY") \
+          or os.environ.get("TOGETHER_API_KEY")
     model = os.environ.get("OPENAI_MODEL") \
-        or os.environ.get("QWEN_MODEL") \
-        or os.environ.get("TOGETHER_MODEL") \
-        or "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
+            or os.environ.get("QWEN_MODEL") \
+            or os.environ.get("TOGETHER_MODEL") \
+            or "meta-llama/Meta-Llama-3.1-8B-Instruct-Turbo"
     return base, key, model
+
 
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", (s or "").strip().lower())
+
 
 def _sent_split(text: str) -> list[str]:
     # 简单句子切分：句号/问号/换行；可按需替换成更强的分句器
     text = (text or "").strip()
     parts = re.split(r"(?<=[\.\?\!])\s+|\n+", text)
     return [p.strip() for p in parts if p.strip()]
+
 
 def _common_prefix_len(a_tokens: list[str], b_tokens: list[str]) -> int:
     n = min(len(a_tokens), len(b_tokens))
@@ -351,16 +355,18 @@ def _common_prefix_len(a_tokens: list[str], b_tokens: list[str]) -> int:
         i += 1
     return i
 
+
 class RAGMemory:
     """
     以 JSONL 方式存储问答记忆（追加写入，按 qid 去重折叠）。
     每条item结构：
       {"qid": "...", "q": "...", "a": "...", "segments": [{"text": "...","t": 1234}, ...], "t": 1234}
     """
+
     def __init__(self, path: str = "data/memory.jsonl"):
         self.path = path
-        self.items = []          # 折叠后的最新视图
-        self._by_qid = {}        # qid -> item
+        self.items = []  # 折叠后的最新视图
+        self._by_qid = {}  # qid -> item
         self._load()
 
     def _load(self):
@@ -372,7 +378,7 @@ class RAGMemory:
                         it = json.loads(line)
                     except Exception:
                         continue
-                    qid = it.get("qid") or _norm(it.get("q",""))
+                    qid = it.get("qid") or _norm(it.get("q", ""))
                     self._by_qid[qid] = it  # 以最后一次为准（折叠）
         self.items = list(self._by_qid.values())
 
@@ -387,7 +393,7 @@ class RAGMemory:
     def exact_match(self, q: str):
         nq = _norm(q)
         for it in self.items:
-            if _norm(it.get("q","")) == nq:
+            if _norm(it.get("q", "")) == nq:
                 return it
         return None
 
@@ -395,10 +401,10 @@ class RAGMemory:
         # 用 TF-IDF 做简易相似度检索
         from sklearn.feature_extraction.text import TfidfVectorizer
         from sklearn.metrics.pairwise import cosine_similarity
-        qs = [_norm(it.get("q","")) for it in self.items]
+        qs = [_norm(it.get("q", "")) for it in self.items]
         if not qs:
             return None, 0.0
-        vec = TfidfVectorizer(stop_words="english", ngram_range=(1,2))
+        vec = TfidfVectorizer(stop_words="english", ngram_range=(1, 2))
         X = vec.fit_transform(qs)
         v = vec.transform([_norm(q)])
         sims = cosine_similarity(X, v).reshape(-1)
@@ -422,7 +428,7 @@ class RAGMemory:
             self._save_replace(item)
             return item
 
-        old_ans = item.get("a","")
+        old_ans = item.get("a", "")
         old_tok = old_ans.split()
         new_tok = (new_full_answer or "").split()
         bp = _common_prefix_len(old_tok, new_tok)  # 断点位置（按词）
@@ -442,6 +448,7 @@ class RAGMemory:
         self._save_replace(new_item)
         return new_item
 
+
 def _answer_via_gstar_llm(query: str, memory_items: list[dict]) -> str:
     """
     用你现有的 GStar 检索 + summarize_path 生成完整新答案。
@@ -449,8 +456,9 @@ def _answer_via_gstar_llm(query: str, memory_items: list[dict]) -> str:
     """
     texts, meta = [], []
     for i, it in enumerate(memory_items):
-        txt = (f"Q: {it.get('q','')}\nA: {it.get('a','')}").strip()
-        texts.append(txt); meta.append({"t": it.get("t", i)})
+        txt = (f"Q: {it.get('q', '')}\nA: {it.get('a', '')}").strip()
+        texts.append(txt);
+        meta.append({"t": it.get("t", i)})
 
     mg = MemoryGraph(texts if texts else ["(empty)"], meta if meta else [{"t": 0}])  # <-- 你现有的类
     q_vec = mg.query_vector(query)
@@ -472,6 +480,7 @@ def _answer_via_gstar_llm(query: str, memory_items: list[dict]) -> str:
     path, _info = astar_search(mg, q_vec, budget_nodes=6, tau=1.6, gamma_q=0.35, rho_path=0.25)
     return summarize_path(texts or ["(empty)"], path, query)
 
+
 def answer_with_memory_router_bp(query: str, memory_path: str = "data/memory.jsonl",
                                  partial_th: float = 0.88) -> Tuple[str, dict]:
     """
@@ -485,7 +494,7 @@ def answer_with_memory_router_bp(query: str, memory_path: str = "data/memory.jso
     # 1) exact
     hit = mem.exact_match(query)
     if hit:
-        return hit.get("a",""), {"route": "exact", "qid": hit.get("qid")}
+        return hit.get("a", ""), {"route": "exact", "qid": hit.get("qid")}
 
     # 2) partial（>=阈值） or novel（<阈值）
     near, score = mem.partial_match(query, threshold=partial_th)
@@ -497,7 +506,8 @@ def answer_with_memory_router_bp(query: str, memory_path: str = "data/memory.jso
 
     # 断点合并到“同一条记忆”（不是新建）
     item = mem.upsert_with_breakpoint(q=query, new_full_answer=ans_full, base_qid=base_qid)
-    return item.get("a",""), {"route": ("partial" if near else "novel"), "near_score": score, "qid": item.get("qid")}
+    return item.get("a", ""), {"route": ("partial" if near else "novel"), "near_score": score, "qid": item.get("qid")}
+
 
 if __name__ == "__main__":
     main()
